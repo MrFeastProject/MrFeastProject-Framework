@@ -290,7 +290,7 @@ class NetworkMonitorService : Service() {
             .setContentText("Повторная проверка каждые 5 сек. URL: $TARGET_URL")
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText("$ALERT_MESSAGE\nСервер недоступен. Проверка выполняется автоматически каждые 5 секунд через Dispatchers.IO до восстановления связи.")
+                    .bigText("$ALERT_MESSAGE\nОжидаем восстановления связи.")
             )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_ERROR)
