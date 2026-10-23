@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">MrFeastProject Framework</string>
+    <string name="notification_channel_name">Мониторинг сети MrFeast</string>
+    <string name="notification_channel_desc">Уведомления о статусе соединения с сервером MrFeastProject</string>
+    <string name="alert_server_unavailable">Нету подключения к серверу MrFeastProject Canada #1</string>
+    <string name="alert_server_unavailable_desc">Проверка выполняется каждые 5 секунд...</string>
+    <string name="service_foreground_title">MrFeastProject Framework активен</string>
+    <string name="service_foreground_desc">Мониторинг сети и сервера в фоновом режиме</string>
+</resources>

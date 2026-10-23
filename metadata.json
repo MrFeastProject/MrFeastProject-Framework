@@ -1,0 +1,6 @@
+{
+  "name": "MrFeastProject Framework",
+  "description": "Background network monitoring service for MrFeastProject framework with automatic network check, auto-boot startup, status notifications, and launcher icon toggle.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
