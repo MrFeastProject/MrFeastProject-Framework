@@ -2,6 +2,7 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.CyberGuardFilterManager
 import com.example.data.NetworkStatusRepository
 import com.example.manager.LauncherIconManager
 import kotlinx.coroutines.test.runTest
@@ -43,5 +44,36 @@ class ExampleRobolectricTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val (hidden, msg) = LauncherIconManager.setLauncherIconHidden(context, true)
         assertNotNull(msg)
+    }
+
+    @Test
+    fun `cyberguard filter manager tracks blocked domains and 24h count`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        CyberGuardFilterManager.init(context)
+
+        // Verify Telegram ads domain is strictly blocked
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("ads.telegram.org"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("https://ads.telegram.org/channel"))
+
+        // Verify YouTube ad domains from user prompt & reference
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("ads.youtube.com"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("s0.2mdn.net"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("s1.2mdn.net"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("pagead2.googlesyndication.com"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("googleads.g.doubleclick.net"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("pubads.g.doubleclick.net"))
+
+        // Verify YouTube video stream CDN ad pattern rx---sn-xxxxx.googlevideo.com
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("r1---sn-4g5ednss.googlevideo.com"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("r5.sn-ab5sznz.googlevideo.com"))
+
+        // Verify base adguard and tracker domains
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("google-analytics.com"))
+        assertTrue(CyberGuardFilterManager.isDomainBlocked("ad.intl.xiaomi.com"))
+        assertEquals(12, CyberGuardFilterManager.FILTER_MODULES.size)
+
+        val before = CyberGuardFilterManager.updateCount24h()
+        CyberGuardFilterManager.recordBlockedThreat(context, "test-malicious-tracker.com", "Test")
+        assertEquals(before + 1, CyberGuardFilterManager.updateCount24h())
     }
 }

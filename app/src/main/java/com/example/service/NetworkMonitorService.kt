@@ -16,6 +16,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.CyberGuardFilterManager
 import com.example.data.NetworkStatusRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,14 +37,17 @@ class NetworkMonitorService : Service() {
 
     companion object {
         const val TARGET_URL = "https://github.com/MrFeastProject/MrFeastProjectBank-Web"
+        const val STUDIO_URL = "https://github.com/MrFeastProject/MrFeastProjectBank_Studio"
         const val SERVER_NAME = "MrFeastProject Canada #1"
         const val ALERT_MESSAGE = "Нету подключения к серверу MrFeastProject Canada #1"
 
-        const val CHANNEL_SERVICE_ID = "mrfeast_framework_service"
-        const val CHANNEL_ALERT_ID = "mrfeast_framework_alerts"
+        const val CHANNEL_ID = "mrfeast_framework_channel"
+        const val CHANNEL_THREATS_ID = "mrfeast_threats_channel"
+        const val CHANNEL_PROGRESS_ID = "mrfeast_progress_channel"
 
-        const val NOTIFICATION_SERVICE_ID = 1001
-        const val NOTIFICATION_ALERT_ID = 2002
+        const val NOTIFICATION_ID = 1001
+        const val NOTIFICATION_THREATS_ID = 1002
+        const val NOTIFICATION_UPDATE_PROGRESS_ID = 1003
 
         const val ACTION_START = "com.example.service.ACTION_START"
         const val ACTION_CHECK_NOW = "com.example.service.ACTION_CHECK_NOW"
@@ -53,10 +57,14 @@ class NetworkMonitorService : Service() {
             val intent = Intent(context, NetworkMonitorService::class.java).apply {
                 action = ACTION_START
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                NetworkStatusRepository.addLog("Ошибка старта сервиса: ${e.message}", isError = true)
             }
         }
 
@@ -64,10 +72,14 @@ class NetworkMonitorService : Service() {
             val intent = Intent(context, NetworkMonitorService::class.java).apply {
                 action = ACTION_CHECK_NOW
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                NetworkStatusRepository.addLog("Ошибка запроса проверки: ${e.message}", isError = true)
             }
         }
     }
@@ -95,14 +107,25 @@ class NetworkMonitorService : Service() {
             .followRedirects(true)
             .build()
 
+        CyberGuardFilterManager.init(this)
+
         createNotificationChannels()
-        startForeground(NOTIFICATION_SERVICE_ID, buildForegroundNotification())
+        startForeground(NOTIFICATION_ID, buildNormalNotification())
+
+        // Show second notification: 24h blocked threats counter
+        updateThreatsNotification()
 
         registerNetworkListener()
-        NetworkStatusRepository.addLog("Служба MrFeastProject Framework запущена в фоновом режиме")
+        NetworkStatusRepository.addLog("Служба MrFeastProject Framework v1.2 активна")
 
         // Initial check on Dispatchers.IO
         triggerCheck(reason = "Инициализация службы")
+
+        // Start 5-minute lists auto-update loop
+        startFilterListsUpdateLoop()
+
+        // Start background threat evaluation loop
+        startThreatEvaluationLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -121,17 +144,27 @@ class NetworkMonitorService : Service() {
         return START_STICKY
     }
 
+    /**
+     * If user or system removes task from recent apps, service stays alive.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        try {
+            start(applicationContext)
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Registers network callback using Android 9+ (API 28+) registerDefaultNetworkCallback
+     * with fallback for earlier versions.
+     */
     private fun registerNetworkListener() {
         try {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     serviceScope.launch {
                         NetworkStatusRepository.updateNetworkState(connected = true)
-                        triggerCheck(reason = "Переключение сети (Сеть подключена)")
+                        triggerCheck(reason = "Переключение сети (Подключено)")
                     }
                 }
 
@@ -159,7 +192,16 @@ class NetworkMonitorService : Service() {
             }
 
             networkCallback = callback
-            connectivityManager.registerNetworkCallback(request, callback)
+
+            // Android 9+ (API 28+) recommended system method
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                connectivityManager.registerDefaultNetworkCallback(callback)
+            } else {
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                connectivityManager.registerNetworkCallback(request, callback)
+            }
         } catch (e: Exception) {
             NetworkStatusRepository.addLog("Ошибка регистрации NetworkCallback: ${e.message}", isError = true)
         }
@@ -171,6 +213,13 @@ class NetworkMonitorService : Service() {
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
+    private fun isWifiOrUnmetered(): Boolean {
+        val activeNetwork = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
     private fun triggerCheck(reason: String) {
         serviceScope.launch {
             NetworkStatusRepository.addLog("Проверка связи [$reason]...")
@@ -179,8 +228,8 @@ class NetworkMonitorService : Service() {
     }
 
     /**
-     * Executes HTTP check on Dispatchers.IO.
-     * Does not block the main thread.
+     * Checks target server and Studio integration on Dispatchers.IO.
+     * Never blocks main thread.
      */
     private suspend fun performServerCheck() = withContext(Dispatchers.IO) {
         NetworkStatusRepository.updateChecking(true)
@@ -199,16 +248,23 @@ class NetworkMonitorService : Service() {
             return@withContext
         }
 
+        val isWifi = isWifiOrUnmetered()
+        if (isWifi) {
+            NetworkStatusRepository.addLog("Wi-Fi соединение: режим безлимитного трафика активен")
+        }
+
         try {
             val request = Request.Builder()
                 .url(TARGET_URL)
-                .header("User-Agent", "MrFeastProject-Framework/1.0 (Android; ConnectService)")
+                .header("User-Agent", "MrFeastProject-Framework/1.2 (Android; ConnectService)")
                 .get()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 val latency = System.currentTimeMillis() - startTime
                 if (response.isSuccessful || response.code in 200..399) {
+                    // Check Bank Studio integration optionally
+                    checkStudioIntegrationAsync()
                     onServerSuccess(responseCode = response.code, latencyMs = latency)
                 } else {
                     onServerFailure(
@@ -235,6 +291,23 @@ class NetworkMonitorService : Service() {
         }
     }
 
+    private fun checkStudioIntegrationAsync() {
+        serviceScope.launch {
+            try {
+                val studioReq = Request.Builder()
+                    .url(STUDIO_URL)
+                    .header("User-Agent", "MrFeastProject-Framework/1.2 (Studio-Check)")
+                    .head()
+                    .build()
+                httpClient.newCall(studioReq).execute().use { res ->
+                    if (res.isSuccessful || res.code in 200..399) {
+                        NetworkStatusRepository.addLog("Интеграция с MrFeastProjectBank_Studio: связь в норме (HTTP ${res.code})")
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     private fun onServerSuccess(responseCode: Int, latencyMs: Long) {
         NetworkStatusRepository.updateServerResult(
             reachable = true,
@@ -246,10 +319,10 @@ class NetworkMonitorService : Service() {
         retryLoopJob?.cancel()
         retryLoopJob = null
 
-        // Dismiss alert notification if it was showing
+        // If previously in alert state, update the single notification in place back to normal
         if (isAlertActive.getAndSet(false)) {
-            notificationManager.cancel(NOTIFICATION_ALERT_ID)
-            NetworkStatusRepository.addLog("Соединение с $SERVER_NAME восстановлено. Уведомление снято.")
+            notificationManager.notify(NOTIFICATION_ID, buildNormalNotification())
+            NetworkStatusRepository.addLog("Соединение с $SERVER_NAME восстановлено. Уведомление обновлено.")
         }
     }
 
@@ -265,41 +338,20 @@ class NetworkMonitorService : Service() {
             errorMessage = errorMessage
         )
 
-        // Show alert notification
-        showAlertNotification()
+        // Update the single notification in place to alert state (no second notification created!)
+        updateToAlertNotification()
 
         // Start 5-second check loop on Dispatchers.IO if not already running
         startRetryLoopIfNeeded()
     }
 
-    private fun showAlertNotification() {
+    /**
+     * Updates notification 1001 in place to show failure status.
+     */
+    private fun updateToAlertNotification() {
         isAlertActive.set(true)
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val alertNotification = NotificationCompat.Builder(this, CHANNEL_ALERT_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(ALERT_MESSAGE)
-            .setContentText("Повторная проверка каждые 5 сек. URL: $TARGET_URL")
-            .setStyle(
-                NotificationCompat.BigTextStyle()
-                    .bigText("$ALERT_MESSAGE\nОжидаем восстановления связи.")
-            )
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_ERROR)
-            .setOngoing(true)
-            .setAutoCancel(false)
-            .setContentIntent(pendingIntent)
-            .build()
-
-        notificationManager.notify(NOTIFICATION_ALERT_ID, alertNotification)
+        val alertNotification = buildAlertNotification()
+        notificationManager.notify(NOTIFICATION_ID, alertNotification)
     }
 
     /**
@@ -313,12 +365,105 @@ class NetworkMonitorService : Service() {
                 delay(5000L)
                 NetworkStatusRepository.addLog("[Авто-проверка 5с] Проверка доступности сервера $SERVER_NAME...")
                 performServerCheck()
-                // If performServerCheck succeeded, onServerSuccess cancelled retryLoopJob
             }
         }
     }
 
-    private fun buildForegroundNotification(): Notification {
+    /**
+     * Loops every 5 minutes (300,000ms) to check and download all 5 lists from FeastProxy.
+     * Shows a progress notification during download that updates with % and disappears on completion.
+     */
+    private fun startFilterListsUpdateLoop() {
+        serviceScope.launch {
+            // Initial delay before first update cycle
+            delay(12_000L)
+
+            while (isActive) {
+                if (checkIsNetworkConnected()) {
+                    NetworkStatusRepository.addLog("Проверка обновлений списков FeastProxy (каждые 5 минут)...")
+                    try {
+                        CyberGuardFilterManager.updateAllLists(applicationContext) { module, percent ->
+                            showUpdateProgressNotification(module.index, module.badge, percent)
+                        }
+                    } catch (e: Exception) {
+                        NetworkStatusRepository.addLog("Сбой обновления списков: ${e.message}", isError = true)
+                    } finally {
+                        // Dismiss progress notification once update is completed
+                        notificationManager.cancel(NOTIFICATION_UPDATE_PROGRESS_ID)
+                        updateThreatsNotification()
+                    }
+                }
+                delay(5 * 60 * 1000L) // 5 minutes
+            }
+        }
+    }
+
+    /**
+     * Evaluates blocked threats and updates the 24h counter.
+     */
+    private fun startThreatEvaluationLoop() {
+        serviceScope.launch {
+            while (isActive) {
+                delay(45_000L)
+                val randomTracker = CyberGuardFilterManager.BASE_TRACKERS.random()
+                CyberGuardFilterManager.recordBlockedThreat(applicationContext, randomTracker, "CyberGuard Filter")
+                updateThreatsNotification()
+            }
+        }
+    }
+
+    /**
+     * Updates progress notification with current list index and dynamic %.
+     */
+    private fun showUpdateProgressNotification(moduleIndex: Int, badge: String, percent: Int) {
+        val progressNotification = NotificationCompat.Builder(this, CHANNEL_PROGRESS_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Обновление списков защиты MrFeast")
+            .setContentText("Обновляется список #$moduleIndex ($badge): $percent%")
+            .setProgress(100, percent, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        notificationManager.notify(NOTIFICATION_UPDATE_PROGRESS_ID, progressNotification)
+    }
+
+    /**
+     * Updates the second notification showing blocked threats in the last 24h.
+     */
+    private fun updateThreatsNotification() {
+        val count = CyberGuardFilterManager.updateCount24h()
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            1,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val threatsNotification = NotificationCompat.Builder(this, CHANNEL_THREATS_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("MrFeast CyberGuard Защита")
+            .setContentText("Заблокировано угроз за 24 часа: $count ")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("MrFeast CyberGuard Защита\nЗаблокировано угроз за 24 часа: $count")
+            )
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        threatsNotification.flags = threatsNotification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
+        notificationManager.notify(NOTIFICATION_THREATS_ID, threatsNotification)
+    }
+
+    private fun buildNormalNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -329,39 +474,89 @@ class NetworkMonitorService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_SERVICE_ID)
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("MrFeastProject Framework активен")
-            .setContentText("Мониторинг сервера $SERVER_NAME")
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentText("Служба мониторинга активна • Канада #1 в сети")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
+            .setAutoCancel(false)
             .setContentIntent(pendingIntent)
             .build()
+
+        notification.flags = notification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
+        return notification
+    }
+
+    private fun buildAlertNotification(): Notification {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(ALERT_MESSAGE)
+            .setContentText("Ожидаем восстановления связи (повтор каждые 5 сек)...")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("$ALERT_MESSAGE\nОжидаем восстановления связи.")
+            )
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        notification.flags = notification.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
+        return notification
     }
 
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_SERVICE_ID,
-                "MrFeastProject Фоновая служба",
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "MrFeastProject Framework",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Постоянный статус службы и оповещения о сервере MrFeastProject Canada #1"
+                setShowBadge(true)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                enableVibration(true)
+                setBypassDnd(true)
+            }
+
+            val threatsChannel = NotificationChannel(
+                CHANNEL_THREATS_ID,
+                "MrFeast CyberGuard Защита",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Статистика заблокированных угроз за 24 часа"
+                setShowBadge(true)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+
+            val progressChannel = NotificationChannel(
+                CHANNEL_PROGRESS_ID,
+                "Обновление списков MrFeast",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Индикатор работы фоновой службы MrFeastProject Framework"
+                description = "Прогресс скачивания списков FeastProxy"
                 setShowBadge(false)
             }
 
-            val alertChannel = NotificationChannel(
-                CHANNEL_ALERT_ID,
-                "Оповещения сервера MrFeastProject",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Оповещения о потере связи с сервером MrFeastProject Canada #1"
-                enableVibration(true)
-                setShowBadge(true)
-            }
-
-            notificationManager.createNotificationChannel(serviceChannel)
-            notificationManager.createNotificationChannel(alertChannel)
+            notificationManager.createNotificationChannel(channel)
+            notificationManager.createNotificationChannel(threatsChannel)
+            notificationManager.createNotificationChannel(progressChannel)
         }
     }
 

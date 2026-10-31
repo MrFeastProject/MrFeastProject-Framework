@@ -8,13 +8,16 @@ import com.example.service.NetworkMonitorService
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        val action = intent?.action
-        if (action == Intent.ACTION_BOOT_COMPLETED ||
-            action == "android.intent.action.QUICKBOOT_POWERON" ||
-            action == Intent.ACTION_MY_PACKAGE_REPLACED
-        ) {
-            NetworkStatusRepository.addLog("Получен сигнал автозапуска системы: $action")
-            NetworkMonitorService.start(context)
+        val action = intent?.action ?: return
+        when (action) {
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_LOCKED_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            "android.intent.action.QUICKBOOT_POWERON",
+            "com.htc.intent.action.QUICKBOOT_POWERON" -> {
+                NetworkStatusRepository.addLog("Автозапуск системы ($action): запуск службы")
+                NetworkMonitorService.start(context)
+            }
         }
     }
 }
